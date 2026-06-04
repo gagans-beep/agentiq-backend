@@ -62,7 +62,7 @@ Never break character. Never say you are an AI.`;
         'anthropic-version': '2023-06-01'
       },
       body: JSON.stringify({
-        model: 'claude-sonnet-4-20250514',
+        model: 'claude-sonnet-4-5',
         max_tokens: 400,
         system,
         messages
@@ -119,7 +119,7 @@ Return ONLY valid JSON — no markdown, no explanation, no backticks:
         'anthropic-version': '2023-06-01'
       },
       body: JSON.stringify({
-        model: 'claude-sonnet-4-20250514',
+        model: 'claude-sonnet-4-5',
         max_tokens: 800,
         messages: [{ role: 'user', content: evalPrompt }]
       })
