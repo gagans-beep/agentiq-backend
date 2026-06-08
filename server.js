@@ -13,12 +13,73 @@ if (!ANTHROPIC_API_KEY) {
 }
 
 app.use(cors({ origin: process.env.FRONTEND_URL || '*', methods: ['GET','POST'] }));
-app.use(express.json({ limit: '2mb' }));
-
-const limiter = rateLimit({ windowMs: 15*60*1000, max: 60, message: { error: 'Too many requests.' } });
+app.use(express.json({ limit: '4mb' }));
+const limiter = rateLimit({ windowMs: 15*60*1000, max: 80, message: { error: 'Too many requests.' } });
 app.use('/api/', limiter);
 
-app.get('/', (req, res) => res.json({ status:'ok', service:'AgentIQ API', version:'2.0.0' }));
+app.get('/', (req, res) => res.json({ status:'ok', service:'AgentIQ API', version:'3.0.0' }));
+
+// ── Helper: call Claude ──
+async function callClaude(system, messages, maxTokens = 600) {
+  const response = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: { 'Content-Type':'application/json', 'x-api-key': ANTHROPIC_API_KEY, 'anthropic-version':'2023-06-01' },
+    body: JSON.stringify({ model: 'claude-sonnet-4-5', max_tokens: maxTokens, system, messages })
+  });
+  if (!response.ok) {
+    const err = await response.json();
+    throw new Error(err.error?.message || 'Anthropic API error');
+  }
+  const data = await response.json();
+  return data.content?.[0]?.text || '';
+}
+
+// ── NEW: Generate scenarios from SOP ──
+app.post('/api/generate-scenarios', async (req, res) => {
+  const { sop } = req.body;
+  if (!sop || sop.trim().length < 50) {
+    return res.status(400).json({ error: 'Please provide a more detailed SOP (at least 50 characters).' });
+  }
+
+  const prompt = `You are an expert customer service trainer. Read the following company SOP / policy document and generate 6 realistic training scenarios that would test whether a support agent properly understands and follows these specific policies.
+
+SOP / POLICY DOCUMENT:
+${sop.slice(0, 4000)}
+
+Generate 6 scenarios that:
+1. Are DIRECTLY based on the actual policies in this SOP (not generic scenarios)
+2. Cover a range of difficulty levels
+3. Test edge cases and tricky situations from the policy
+4. Would realistically happen to a customer
+
+Return ONLY valid JSON — no markdown, no backticks, no explanation:
+[
+  {
+    "id": "sop_1",
+    "icon": "💳",
+    "title": "Short scenario title",
+    "desc": "One line description",
+    "diff": "Easy",
+    "diffClass": "diff-easy",
+    "brief": "Detailed situation the customer is in, referencing specific policy details",
+    "hints": ["hint 1", "hint 2", "hint 3"],
+    "sopGenerated": true
+  }
+]
+
+Use diffClass: "diff-easy" for Easy, "diff-medium" for Medium, "diff-hard" for Hard.
+Use relevant emojis for icons.`;
+
+  try {
+    const raw = await callClaude('You are a customer service training expert. Return only valid JSON.', [{ role:'user', content: prompt }], 2000);
+    const cleaned = raw.replace(/```json|```/g,'').trim();
+    const scenarios = JSON.parse(cleaned);
+    res.json({ scenarios });
+  } catch(err) {
+    console.error('Generate scenarios error:', err);
+    res.status(500).json({ error: 'Could not generate scenarios. Please try again.' });
+  }
+});
 
 // ── Chat endpoint ──
 app.post('/api/chat', async (req, res) => {
@@ -26,31 +87,25 @@ app.post('/api/chat', async (req, res) => {
   if (!scenario || !mood) return res.status(400).json({ error: 'Missing required fields.' });
 
   const sopSection = sop
-    ? `\n\nCOMPANY POLICY / SOP (you are aware of these policies as the customer — if the agent violates them, push back or question them):\n${sop.slice(0, 3000)}`
+    ? `\n\nCOMPANY POLICY / SOP:\n${sop.slice(0,3000)}\nYou are aware of these policies. If the agent violates them or gives wrong information, react accordingly — question them, push back, or express concern.`
     : '';
 
-  const system = `You are roleplaying as a customer in a live support chat session.
+  const system = `You are roleplaying as a customer in a live support chat.
 Scenario: ${scenario}
 Your name is ${moodName}. ${moodPrompt}${sopSection}
 ${isOpening
-  ? 'Open the conversation by describing your issue in 1-3 sentences. Be natural — speak as a real person would.'
-  : 'Respond to the support agent. Stay fully in character. If a SOP is provided, you are aware of the company\'s policies — if the agent gives wrong information or violates policy, react accordingly. React naturally to how well they handle you. Keep replies to 1-4 sentences.'
+  ? 'Open the conversation by describing your issue naturally in 1-3 sentences.'
+  : 'Respond to the agent. Stay in character. React naturally — soften if they help well, push back if they are vague or wrong. Keep replies to 1-4 sentences.'
 }
 Never break character. Never say you are an AI.`;
 
   const messages = isOpening ? [{ role:'user', content:'Start the conversation.' }] : history;
 
   try {
-    const response = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: { 'Content-Type':'application/json', 'x-api-key':ANTHROPIC_API_KEY, 'anthropic-version':'2023-06-01' },
-      body: JSON.stringify({ model:'claude-sonnet-4-5', max_tokens:400, system, messages })
-    });
-    if (!response.ok) { const err = await response.json(); return res.status(response.status).json({ error: err.error?.message }); }
-    const data = await response.json();
-    res.json({ reply: data.content?.[0]?.text || '' });
+    const reply = await callClaude(system, messages, 400);
+    res.json({ reply });
   } catch(err) {
-    res.status(500).json({ error: 'Server error.' });
+    res.status(500).json({ error: err.message });
   }
 });
 
@@ -60,40 +115,34 @@ app.post('/api/evaluate', async (req, res) => {
   if (!transcript) return res.status(400).json({ error: 'No transcript.' });
 
   const sopSection = sop
-    ? `\n\nCOMPANY SOP / POLICY PROVIDED:\n${sop.slice(0, 3000)}\n\nAlso add a "sop_compliance" field in your JSON — 2-3 sentences assessing how well the agent followed the company's specific SOP/policy rules.`
+    ? `\n\nCOMPANY SOP PROVIDED:\n${sop.slice(0,3000)}\n\nAlso include "sop_compliance": a 2-3 sentence assessment of how well the agent followed the specific SOP rules.`
     : '';
 
-  const evalPrompt = `You are an expert customer service trainer evaluating an agent's chat performance.
+  const evalPrompt = `You are an expert customer service trainer evaluating a support agent.
 
 Scenario: ${scenarioBrief}
 Customer mood: ${mood}${sopSection}
 
-Full transcript:
+Transcript:
 ${transcript}
 
-Score the agent across 5 dimensions (0–20 each, 100 total):
+Score across 5 dimensions (0–20 each):
 1. Empathy & tone
-2. Problem understanding
+2. Problem understanding  
 3. Resolution quality
 4. Communication clarity
 5. Professionalism
 
-Return ONLY valid JSON — no markdown, no backticks:
-{"total":78,"grade":"Good","summary":"One-sentence overall summary.","rubric":{"Empathy & tone":16,"Problem understanding":15,"Resolution quality":14,"Communication clarity":17,"Professionalism":16},"strengths":["strength one","strength two"],"improvements":["area one","area two"],"coaching":"2-3 sentences of specific actionable coaching advice."${sop ? ',"sop_compliance":"How well the agent followed the company SOP."' : ''}}`;
+Return ONLY valid JSON:
+{"total":78,"grade":"Good","summary":"One sentence.","rubric":{"Empathy & tone":16,"Problem understanding":15,"Resolution quality":14,"Communication clarity":17,"Professionalism":16},"strengths":["s1","s2"],"improvements":["i1","i2"],"coaching":"2-3 sentences of specific advice."${sop ? ',"sop_compliance":"SOP compliance feedback."' : ''}}`;
 
   try {
-    const response = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: { 'Content-Type':'application/json', 'x-api-key':ANTHROPIC_API_KEY, 'anthropic-version':'2023-06-01' },
-      body: JSON.stringify({ model:'claude-sonnet-4-5', max_tokens:1000, messages:[{ role:'user', content:evalPrompt }] })
-    });
-    if (!response.ok) { const err = await response.json(); return res.status(response.status).json({ error: err.error?.message }); }
-    const data = await response.json();
-    let raw = (data.content?.[0]?.text || '{}').replace(/```json|```/g,'').trim();
-    res.json(JSON.parse(raw));
+    const raw = await callClaude('You are a customer service training expert. Return only valid JSON.', [{ role:'user', content: evalPrompt }], 1000);
+    const cleaned = raw.replace(/```json|```/g,'').trim();
+    res.json(JSON.parse(cleaned));
   } catch(err) {
-    res.status(500).json({ error: 'Could not evaluate.' });
+    res.status(500).json({ error: 'Could not evaluate session.' });
   }
 });
 
-app.listen(PORT, () => console.log(`✅  AgentIQ v2 running on port ${PORT}`));
+app.listen(PORT, () => console.log(`✅  AgentIQ v3 running on port ${PORT}`));
