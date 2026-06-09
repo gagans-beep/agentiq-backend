@@ -146,3 +146,74 @@ Return ONLY valid JSON:
 });
 
 app.listen(PORT, () => console.log(`✅  AgentIQ v3 running on port ${PORT}`));
+
+
+// ── QA Score endpoint ──
+app.post('/api/qa-score', async (req, res) => {
+  const { sop, chat, scorecard, agentName, agentId } = req.body;
+  if (!sop || !chat || !scorecard?.length) {
+    return res.status(400).json({ error: 'Missing sop, chat, or scorecard.' });
+  }
+
+  const scorecardText = scorecard.map(p =>
+    `- ${p.name}: max ${p.max} points, pass threshold ${p.pass} points`
+  ).join('\n');
+
+  const totalMax = scorecard.reduce((s, p) => s + p.max, 0);
+
+  const prompt = `You are an expert customer service QA analyst. Evaluate the following chat transcript against the company SOP and the provided scorecard.
+
+COMPANY SOP / POLICY:
+${sop.slice(0, 3500)}
+
+CHAT TRANSCRIPT:
+${chat.slice(0, 4000)}
+
+SCORECARD (${totalMax} total points):
+${scorecardText}
+
+${agentName ? `Agent: ${agentName}${agentId ? ' (' + agentId + ')' : ''}` : ''}
+
+Instructions:
+- Score the agent on EACH parameter based on what actually happened in the chat
+- Be specific — reference actual things the agent said or didn't say
+- Find specific quotes from the transcript that support your scoring
+- Identify any SOP violations
+- total_score must equal the sum of all parameter scored values
+
+Return ONLY valid JSON — no markdown, no backticks:
+{
+  "total_score": 72,
+  "grade": "Needs Improvement",
+  "summary": "One sentence overall assessment of this interaction.",
+  "parameters": [
+    {
+      "name": "Parameter name exactly as given",
+      "max": 10,
+      "pass": 7,
+      "scored": 8,
+      "reason": "2-3 sentences explaining why this score was given based on the transcript.",
+      "good_quote": "A specific quote from the agent that was good (or null)",
+      "bad_quote": "A specific quote from the agent that was bad or missing (or null)"
+    }
+  ],
+  "sop_violations": [
+    "Specific policy that was violated and how"
+  ],
+  "coaching": "3-4 sentences of specific, actionable coaching advice for this agent based on this chat."
+}`;
+
+  try {
+    const raw = await callClaude(
+      'You are a QA analyst. Score the chat transcript objectively. Return only valid JSON.',
+      [{ role: 'user', content: prompt }],
+      2500
+    );
+    const cleaned = raw.replace(/```json|```/g, '').trim();
+    const result = JSON.parse(cleaned);
+    res.json(result);
+  } catch(err) {
+    console.error('QA score error:', err);
+    res.status(500).json({ error: 'Could not score the chat. Please try again.' });
+  }
+});
