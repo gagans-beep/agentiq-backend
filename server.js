@@ -78,9 +78,9 @@ diffClass: diff-easy/diff-medium/diff-hard`;
   } catch(e) { res.status(500).json({ error: 'Could not generate scenarios.' }); }
 });
 
-// ── QA Score — IMPROVED PROMPT ──
+// ── QA Score with OMS context ──
 app.post('/api/qa-score', async (req, res) => {
-  const { sop, chat, scorecard, agentName, agentId } = req.body;
+  const { sop, chat, scorecard, agentName, agentId, omsContext } = req.body;
   if (!chat || !scorecard?.length) return res.status(400).json({ error: 'Missing chat or scorecard.' });
 
   const totalMax = scorecard.reduce((s,p) => s+p.max, 0);
@@ -88,48 +88,64 @@ app.post('/api/qa-score', async (req, res) => {
     `- "${p.name}": max ${p.max} pts, pass at ${p.pass} pts`
   ).join('\n');
 
-  // IMPROVED PROMPT: forces Claude to quote the transcript before scoring each parameter
-  const evalPrompt = `You are a strict, accurate customer service QA analyst. Your job is to score this chat ONLY based on what was ACTUALLY SAID in the transcript — not what you assume happened.
+  // Build OMS context section
+  let omsSection = '';
+  if(omsContext && !omsContext.error && !omsContext.note){
+    omsSection = `\nACTUAL ORDER DATA FROM OMS (use this as ground truth to verify what the agent told the customer):
+${JSON.stringify(omsContext, null, 2).slice(0, 2000)}
 
-${sop ? `COMPANY SOP / POLICY:\n${sop.slice(0,3500)}\n\n` : ''}CHAT TRANSCRIPT:
+IMPORTANT: Compare what the agent told the customer against the actual OMS data above.
+- If the agent gave correct information matching the OMS → credit them
+- If the agent gave wrong information vs the OMS → penalise under Resolution Quality and SOP Compliance
+- If the agent didn't check the order at all when they should have → penalise under Problem Understanding\n`;
+  } else if(omsContext?.note){
+    omsSection = `\nOMS NOTE: ${omsContext.note}\n`;
+  } else if(omsContext?.error){
+    omsSection = `\nOMS NOTE: ${omsContext.error} — score based on transcript only.\n`;
+  }
+
+  const evalPrompt = `You are a strict, accurate customer service QA analyst. Score this chat ONLY based on what was ACTUALLY SAID in the transcript — not assumptions.
+
+${sop ? `COMPANY SOP / POLICY:\n${sop.slice(0,3500)}\n` : ''}${omsSection}
+CHAT TRANSCRIPT${agentId ? ' ('+agentId+')' : ''}:
 ${chat.slice(0,4000)}
 
 SCORECARD (${totalMax} total points):
 ${scorecardText}
 
-INSTRUCTIONS:
+SCORING RULES:
 1. Read the full transcript carefully first.
-2. For EACH parameter, find the specific lines in the transcript that are relevant.
+2. For each parameter, find the specific lines in the transcript that are relevant.
 3. Score ONLY what you can see happened — if something is missing, score it low.
-4. good_quote and bad_quote must be ACTUAL QUOTES copied from the transcript above (or null if none).
-5. total_score must equal the exact sum of all scored values.
-6. Be honest and strict — a 90+ score means the agent was excellent on EVERY parameter.
+4. If OMS data is provided, use it as ground truth to verify agent accuracy.
+5. good_quote and bad_quote must be ACTUAL QUOTES from the transcript (or null).
+6. total_score must equal the exact sum of all scored values.
+7. Be strict — 90+ means excellent on EVERY parameter.
 
-Return ONLY valid JSON, no markdown:
+Return ONLY valid JSON:
 {
   "total_score": 68,
   "grade": "Needs Improvement",
-  "summary": "One accurate sentence based on what happened in the chat.",
+  "summary": "One accurate sentence based on what happened in this chat.",
   "parameters": [
     {
-      "name": "exact parameter name from scorecard",
+      "name": "exact parameter name",
       "max": 20,
       "pass": 14,
       "scored": 12,
-      "reason": "2-3 sentences explaining what the agent DID or DIDN'T do, with specific reference to the transcript.",
-      "good_quote": "exact quote from transcript that earned points, or null",
-      "bad_quote": "exact quote from transcript showing what was wrong, or null"
+      "reason": "What the agent DID or DIDN'T do, with reference to the transcript and OMS data if relevant.",
+      "good_quote": "actual quote from transcript or null",
+      "bad_quote": "actual quote showing what was wrong or null"
     }
   ],
-  "sop_violations": [
-    "Specific policy from SOP that was violated, and which line in the transcript violated it"
-  ],
-  "coaching": "3 specific, actionable coaching points based on what actually happened in this chat."
+  "sop_violations": ["Specific policy violated and which line in transcript"],
+  "oms_discrepancies": ["Any mismatch between what agent said and actual OMS data"],
+  "coaching": "3 specific actionable coaching points based on what actually happened."
 }`;
 
   try {
     const raw = await callClaude(
-      'You are a strict QA analyst. Score ONLY what you see in the transcript. Return only valid JSON.',
+      'You are a strict QA analyst. Score ONLY what you see. Return only valid JSON.',
       [{ role:'user', content:evalPrompt }],
       2000
     );
@@ -137,7 +153,35 @@ Return ONLY valid JSON, no markdown:
     res.json(result);
   } catch(e) {
     console.error('QA score error:', e.message);
-    res.status(500).json({ error: 'Could not score the chat. Please try again.' });
+    res.status(500).json({ error: 'Could not score. Please try again.' });
+  }
+});
+
+// ── Extract order ID from transcript using Claude ──
+app.post('/api/extract-order-id', async (req, res) => {
+  const { transcript } = req.body;
+  if(!transcript) return res.status(400).json({ error: 'No transcript.' });
+
+  const prompt = `Read this customer support chat transcript and extract the order ID, ticket ID, or reference number mentioned.
+
+Transcript:
+${transcript.slice(0,2000)}
+
+Return ONLY valid JSON with one field:
+{"order_id": "the extracted ID or null if none found"}
+
+Common formats: #12345, ORD-12345, ORDER123456, AWB1234567890, TKT-001`;
+
+  try {
+    const raw = await callClaude(
+      'Extract the order ID from the transcript. Return only valid JSON.',
+      [{ role:'user', content:prompt }],
+      100
+    );
+    const result = JSON.parse(raw.replace(/```json|```/g,'').trim());
+    res.json(result);
+  } catch {
+    res.json({ order_id: null });
   }
 });
 
